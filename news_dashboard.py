@@ -80,7 +80,7 @@ def summarize_clusters_ollama(articles, model="llama3.2"):
             continue
 
         try:
-            prompt = f"Summarize these news articles about {cluster}:\n\n{articles_in_cluster}. Determine if each articls is positive or negative in regards to stok market"
+            prompt = f"Summarize these news articles about {cluster}:\n\n{articles_in_cluster}. Determine if each article is positive or negative in regards to stock market"
             response = requests.post(
                 "http://localhost:11434/api/generate",
                 json={"model": model, "prompt": prompt},
