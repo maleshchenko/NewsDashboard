@@ -3,11 +3,18 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import streamlit as st
 import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import uuid
+
+stocks_of_interest = ["AAPL", "TSLA", "AMZN", "GOOGL", "MSFT"]
+
+# ----------------------------- Scraping Functions -----------------------------
 
 def get_news_data():
+    """Scrape Google News for stock market-related articles."""
     headers = {
-        "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36"
     }
     response = requests.get(
         "https://www.google.com/search?q=us+stock+markets&gl=us&tbm=nws&num=5", headers=headers
@@ -19,11 +26,11 @@ def get_news_data():
         try:
             news_results.append(
                 {
-                    "link": el.find("a")["href"],
-                    "title": el.select_one("div.MBeuO").get_text(),
-                    "snippet": el.select_one(".GI74Re").get_text(),
-                    "date": el.select_one(".LfVVr").get_text(),
-                    "source": el.select_one(".NUnG9d span").get_text()
+                    "link": el.find("a")["href"] if el.find("a") else "No link available",
+                    "title": el.select_one("div.MBeuO").get_text() if el.select_one("div.MBeuO") else "No title available",
+                    "snippet": el.select_one(".GI74Re").get_text() if el.select_one(".GI74Re") else "No snippet available",
+                    "date": el.select_one(".LfVVr").get_text() if el.select_one(".LfVVr") else "No date available",
+                    "source": el.select_one(".NUnG9d span").get_text() if el.select_one(".NUnG9d span") else "No source available"
                 }
             )
         except AttributeError:
@@ -38,7 +45,42 @@ def get_news_data():
     print("Data saved to news_data.csv")
     return df
 
+# --------------------------- Historical Data Handling -------------------------
+
+def load_historical_data(file_path="historical_data.csv"):
+    """Load historical sentiment data."""
+    try:
+        return pd.read_csv(file_path)
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["title", "snippet", "link", "date", "source", "sentiment"])
+
+def save_historical_data(new_data, file_path="historical_data.csv"):
+    """Save sentiment data to historical storage with a date separator."""
+    # Load existing data
+    historical_data = load_historical_data(file_path)
+    
+    # Create a date separator row
+    date_separator_row = {
+        "title": f"\n--- {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n",
+        "snippet": "",
+        "link": "",
+        "date": "",
+        "source": "",
+        "sentiment": ""
+    }
+    date_separator_df = pd.DataFrame([date_separator_row])
+    
+    # Combine the date separator, new data, and historical data
+    updated_data = pd.concat([historical_data, date_separator_df, new_data], ignore_index=True)
+    
+    # Save to file
+    updated_data.to_csv(file_path, index=False)
+    print(f"Historical data updated and saved to {file_path}")
+
+# ------------------------- Sentiment Analysis Functions -----------------------
+
 def process_ollama_response(response_text):
+    """Process and parse response text from the Ollama API."""
     result = []
     for line in response_text.splitlines():
         try:
@@ -47,66 +89,89 @@ def process_ollama_response(response_text):
                 result.append(json_line["response"])
         except json.JSONDecodeError as e:
             print(f"Error parsing line: {line} - {e}")
-    return "".join(result).strip()  # Concatenate all partial responses
+    return "".join(result).strip()
 
-def extract_keywords_and_cluster_ollama(articles, model="llama3.2"):
-    clusters = []
-    for article in articles:
-        try:
-            prompt = f"Extract keywords and suggest a topic cluster for the following news headline:\n\n'{article['title']}'"
-            response = requests.post(
-                "http://localhost:11434/api/generate",
-                json={"model": model, "prompt": prompt},
-            )
-            parsed_response = process_ollama_response(response.text)
+def analyze_sentiment_for_article(article, stocks, model="deepseek-r1:7b"): # "llama3.2"):
+    """Analyze sentiment for a single news article."""
+    try:
+        prompt = (
+            f"Analyze the sentiment of the following news article:\n\n"
+            f"Title: {article['title']}\nSnippet: {article['snippet']}\n\n"
+            f"Provide a recommendation for each stock: buy, sell, or hold."
+        )
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model, "prompt": prompt},
+        )
+        parsed_response = process_ollama_response(response.text)
+        return article, parsed_response
+    except Exception as e:
+        print(f"Error analyzing sentiment for article: {e}")
+        return article, "Unable to analyze sentiment."
 
-            print("Raw Response:", response.text)  # Log the raw streaming response
-            print("Parsed Response:", parsed_response)  # Log the final processed response
+def get_stock_recommendations(articles, stocks, model="llama3.2"):
+    """Run sentiment analysis for all articles in parallel."""
+    with ThreadPoolExecutor() as executor:
+        results = list(
+            executor.map(lambda article: analyze_sentiment_for_article(article, stocks, model), articles)
+        )
+    return results
 
-            cluster = parsed_response or "Uncategorized"
-            clusters.append({"title": article["title"], "cluster": cluster})
-        except Exception as e:
-            print(f"Error in Ollama processing: {e}")
-            clusters.append({"title": article["title"], "cluster": "Uncategorized"})
-    return clusters
+# -------------------------- Recommendation Aggregation ------------------------
 
-def summarize_clusters_ollama(articles, model="llama3.2"):
-    summaries = {}
-    clusters = set(article["cluster"] for article in articles)
-    for cluster in clusters:
-        articles_in_cluster = [article["title"] for article in articles if article["cluster"] == cluster]
-        if not articles_in_cluster:
-            summaries[cluster] = "No articles available for summarization."
-            continue
+def aggregate_recommendations_with_history(sentiment_results, stocks, historical_data, recency_weight=2, historical_decay=0.5):
+    """Aggregate recommendations using current and historical data with recency weighting."""
+    stock_sentiments = {stock: [] for stock in stocks}
 
-        try:
-            prompt = f"Summarize these news articles about {cluster}:\n\n{articles_in_cluster}. Determine if each article is positive or negative in regards to stock market"
-            response = requests.post(
-                "http://localhost:11434/api/generate",
-                json={"model": model, "prompt": prompt},
-            )
-            parsed_response = process_ollama_response(response.text)
-            summary = parsed_response or "Unable to generate summary."
-            summaries[cluster] = summary
-        except Exception as e:
-            print(f"Error summarizing cluster {cluster} with Ollama: {e}")
-            summaries[cluster] = "Unable to generate summary."
-    return summaries
+    # Add current sentiment results with full weight
+    for _, sentiment in sentiment_results:
+        for stock in stocks:
+            if stock in sentiment:
+                if "buy" in sentiment.lower():
+                    stock_sentiments[stock].extend(["buy"] * recency_weight)
+                elif "sell" in sentiment.lower():
+                    stock_sentiments[stock].extend(["sell"] * recency_weight)
+                elif "hold" in sentiment.lower():
+                    stock_sentiments[stock].extend(["hold"] * recency_weight)
 
-def display_ui():
-    df = pd.read_csv("categorized_news.csv")
-    st.title("Google News Topics & Summaries")
+    # Add historical data with decay factor for older entries
+    for stock in stocks:
+        historical_sentiments = historical_data[historical_data["sentiment"].str.contains(stock, na=False)]
+        for index, row in historical_sentiments.iterrows():
+            weight = max(1, recency_weight * (historical_decay ** index))  # Apply decay
+            if "buy" in row["sentiment"].lower():
+                stock_sentiments[stock].extend(["buy"] * int(weight))
+            elif "sell" in row["sentiment"].lower():
+                stock_sentiments[stock].extend(["sell"] * int(weight))
+            elif "hold" in row["sentiment"].lower():
+                stock_sentiments[stock].extend(["hold"] * int(weight))
 
-    topics = df["cluster"].unique()
-    selected_topic = st.selectbox("Select a Topic", topics)
+    # Calculate final recommendation and confidence
+    final_recommendations = {}
+    for stock, sentiments in stock_sentiments.items():
+        if sentiments:
+            sentiment_counts = {s: sentiments.count(s) for s in set(sentiments)}
+            final_sentiment = max(sentiment_counts, key=sentiment_counts.get)
+            confidence = (sentiment_counts[final_sentiment] / len(sentiments)) * 100
+            final_recommendations[stock] = {"recommendation": final_sentiment, "confidence": round(confidence, 2)}
+        else:
+            final_recommendations[stock] = {"recommendation": "No recommendation", "confidence": 0.0}
 
-    st.subheader(f"Articles about {selected_topic}")
-    filtered_df = df[df["cluster"] == selected_topic]
+    return final_recommendations
 
-    st.write(filtered_df[["title", "link", "source"]].to_dict(orient="records"))
+# ----------------------------- Streamlit UI -----------------------------------
 
-    st.subheader("Summary")
-    st.write(filtered_df["summary"].iloc[0])
+def display_ui(stock_recommendations):
+    """Display stock recommendations in Streamlit."""
+
+    # Display stock recommendations
+    st.subheader("Stock Recommendations")
+    for stock, recommendation_data in stock_recommendations.items():
+        recommendation = recommendation_data["recommendation"]
+        confidence = recommendation_data["confidence"]
+        st.write(f"**{stock}**: {recommendation} (Confidence: {confidence}%)")
+
+# ------------------------------- Main Script ----------------------------------
 
 if __name__ == "__main__":
     print("Scraping Google News...")
@@ -115,19 +180,29 @@ if __name__ == "__main__":
     if news_data.empty:
         print("No data to process. Exiting.")
     else:
-        print("Extracting keywords and clustering articles using Ollama...")
-        articles_with_clusters = [
-            {**article, "cluster": extract_keywords_and_cluster_ollama([article])[0]["cluster"]}
-            for article in news_data.to_dict(orient="records")
-        ]
+        print("Loading historical data...")
+        historical_data = load_historical_data()
 
-        print("Summarizing clusters using Ollama...")
-        summaries = summarize_clusters_ollama(articles_with_clusters)
+        print("Analyzing sentiment for articles...")
+        articles = news_data.to_dict(orient="records")
+        sentiment_results = get_stock_recommendations(articles, stocks_of_interest)
 
-        df = pd.DataFrame(articles_with_clusters)
-        df["summary"] = df["cluster"].map(summaries)
-        df.to_csv("categorized_news.csv", index=False)
-        print("Categorized data saved to categorized_news.csv")
+        print("Aggregating stock recommendations with historical data...")
+        stock_recommendations = aggregate_recommendations_with_history(sentiment_results, stocks_of_interest, historical_data)
+
+        print("Saving current sentiment results to historical data...")
+        current_data = pd.DataFrame([
+            {
+                "title": article["title"],
+                "snippet": article["snippet"],
+                "link": article["link"],
+                "date": article["date"],
+                "source": article["source"],
+                "sentiment": sentiment
+            }
+            for article, sentiment in sentiment_results
+        ])
+        save_historical_data(current_data)
 
         print("Launching Streamlit UI...")
-        display_ui()
+        display_ui(stock_recommendations)
